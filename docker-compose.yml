@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    container_name: burger_support_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app/app
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: python -m watchfiles --filter python "python -m app.main" /app/app

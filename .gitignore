@@ -1,0 +1,72 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Runtime data
+data/
+logs/
+
+# Personal Telegram session / exported data (scripts/export_topics.py)
+*.session
+*.session-journal
+topics_export.json*
+topics_export_media/
+dialog_analysis/
+
+# Claude
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# mypy
+.mypy_cache/
+
+# Docker
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# TLS-ключи/сертификаты — никогда не коммитить
+*.pem
