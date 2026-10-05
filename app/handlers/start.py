@@ -19,7 +19,7 @@ async def send_welcome(message: Message):
 
 
 async def set_commands(bot):
-    """Set bot commands: /start for users, /delete and /s for admins in the support chat."""
+    """Set bot commands: /start for users; topic and AI controls for admins in the support chat."""
     await bot.set_my_commands([
         BotCommand(command="start", description="Обратиться в поддержку")
     ])
@@ -27,6 +27,11 @@ async def set_commands(bot):
         [
             BotCommand(command="delete", description="Удалить топик заявки"),
             BotCommand(command="s", description="Обновить карточку клиента"),
+            BotCommand(command="stop", description="Остановить ИИ в этом топике"),
+            BotCommand(command="start", description="Включить ИИ в этом топике"),
+            BotCommand(command="pauseai", description="Остановить ИИ во всех чатах"),
+            BotCommand(command="resumeai", description="Включить ИИ во всех чатах"),
+            BotCommand(command="outage", description="Массовый сбой: /outage текст | off"),
         ],
         scope=BotCommandScopeChat(chat_id=int(SUPPORT_CHAT_ID))
     )

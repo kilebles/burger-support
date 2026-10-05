@@ -8,5 +8,7 @@ services:
     volumes:
       - ./app:/app/app
       - ./data:/app/data
+      # База знаний ИИ не в git (внутренняя методичка) — кладётся на сервер отдельно
+      - ./kb:/app/kb:ro
       - ./logs:/app/logs
     command: python -m watchfiles --filter python "python -m app.main" /app/app

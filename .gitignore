@@ -70,3 +70,8 @@ Thumbs.db
 
 # TLS-ключи/сертификаты — никогда не коммитить
 *.pem
+
+# Support knowledge sources: real client chats export + internal manual — never in git (public repo)
+result.json
+*.pdf
+kb/
