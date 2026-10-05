@@ -24,7 +24,7 @@ _DEBOUNCE_SECONDS = 6.0
 
 # Что модель умеет прочитать сама. Документы-картинки (скрин, отправленный
 # "файлом" без сжатия) и PDF-чеки читаем так же, как фото.
-_IMAGE_MIME = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}
+_IMAGE_MIME = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 _MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 _MAX_ATTACHMENTS = 6
 
@@ -122,7 +122,7 @@ async def _read_message(message: Message) -> tuple[str, Optional[Attachment]]:
     if message.photo:
         source, mime, kind = message.photo[-1], "image/jpeg", "фото"  # -1 = наибольшее разрешение
     elif message.voice:
-        source, mime, kind = message.voice, message.voice.mime_type or "audio/ogg", "голосовое"
+        return f"{text}\n[клиент прислал голосовое — прослушать нельзя]".strip(), None
     elif message.document and not message.animation:
         doc_mime = message.document.mime_type or ""
         if doc_mime in _IMAGE_MIME:
