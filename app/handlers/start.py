@@ -2,6 +2,7 @@ from aiogram import Router
 from aiogram.filters import CommandStart
 from aiogram.types import BotCommand, BotCommandScopeChat, Message
 
+from app.handlers.faq import faq_entry_keyboard
 from app.settings import SUPPORT_CHAT_ID
 
 
@@ -13,20 +14,23 @@ async def send_welcome(message: Message):
     """Handle /start command - show welcome message."""
     welcome_text = (
         "Это бот поддержки Burger VPN\n\n"
-        "Мы работаем 24/7, опишите вашу проблему – мы ее решим"
+        "Мы работаем 24/7, опишите вашу проблему – мы ее решим.\n\n"
+        "Ответы на частые вопросы — по кнопке ниже, без ожидания."
     )
-    await message.answer(welcome_text)
+    await message.answer(welcome_text, reply_markup=faq_entry_keyboard())
 
 
 async def set_commands(bot):
     """Set bot commands: /start for users; topic and AI controls for admins in the support chat."""
     await bot.set_my_commands([
-        BotCommand(command="start", description="Обратиться в поддержку")
+        BotCommand(command="start", description="Обратиться в поддержку"),
+        BotCommand(command="faq", description="Частые вопросы"),
     ])
     await bot.set_my_commands(
         [
             BotCommand(command="delete", description="Удалить топик заявки"),
             BotCommand(command="s", description="Обновить карточку клиента"),
+            BotCommand(command="q", description="Быстрые ответы клиенту"),
             BotCommand(command="stop", description="Остановить ИИ в этом топике"),
             BotCommand(command="start", description="Включить ИИ в этом топике"),
             BotCommand(command="pauseai", description="Остановить ИИ во всех чатах"),

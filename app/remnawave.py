@@ -181,3 +181,55 @@ async def get_panel_lines(telegram_id: int) -> list[str]:
         lines.append("")
         lines.extend(_subscription_lines(user, devices, last_request, node))
     return lines
+
+
+# --- Действия по кнопкам админа в топике (запись в панель) ---
+
+
+async def _post(path: str, payload: dict[str, Any]) -> bool:
+    """POST к API панели. True — панель ответила 2xx."""
+    if not REMNAWAVE_URL or not REMNAWAVE_TOKEN:
+        return False
+    headers = {"Authorization": f"Bearer {REMNAWAVE_TOKEN}"}
+    if REMNAWAVE_COOKIE:
+        headers["Cookie"] = REMNAWAVE_COOKIE
+    try:
+        async with httpx.AsyncClient(base_url=REMNAWAVE_URL.rstrip("/"), headers=headers, timeout=_TIMEOUT) as client:
+            response = await client.post(path, json=payload)
+    except httpx.HTTPError as error:
+        logger.warning(f"Failed to reach Remnawave (POST {path}): {error}")
+        return False
+    if response.status_code >= 300:
+        logger.warning(f"Remnawave POST {path} -> {response.status_code}: {response.text[:200]}")
+        return False
+    return True
+
+
+async def get_personal_user(telegram_id: int) -> Optional[dict[str, Any]]:
+    """Личная подписка клиента (username w_...), как её выбирает BurgerVPN;
+    если личной нет — самая свежая по сроку."""
+    users = await _get_users(telegram_id)
+    if not users:
+        return None
+    personal = [u for u in users if (u.get("username") or "").startswith("w_")]
+    pool = personal or users
+    pool.sort(key=lambda u: u.get("expireAt") or "", reverse=True)
+    return pool[0]
+
+
+async def reset_devices(telegram_id: int) -> Optional[tuple[int, int]]:
+    """Удалить все устройства личной подписки клиента (как "удалить устройство"
+    в боте BurgerVPN, только все сразу). Возвращает (удалено, было) или None,
+    если подписка не найдена. Других полей подписки не касается."""
+    user = await get_personal_user(telegram_id)
+    if user is None:
+        return None
+    user_id = user.get("id", user.get("uuid"))
+    devices = await _get_devices(user_id)
+    deleted = 0
+    for device in devices:
+        hwid = device.get("hwid")
+        if hwid and await _post("/api/hwid/devices/delete", {"userId": user_id, "hwid": hwid}):
+            deleted += 1
+    logger.info(f"Reset devices for telegram_id={telegram_id}: {deleted}/{len(devices)}")
+    return deleted, len(devices)

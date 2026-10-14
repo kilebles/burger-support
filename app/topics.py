@@ -1,5 +1,6 @@
 import asyncio
 import json
+from html import escape
 from typing import Awaitable, Callable, Optional
 
 import aiofiles
@@ -36,6 +37,11 @@ async def _save() -> None:
         await f.write(json.dumps(_cache, ensure_ascii=False, indent=2))
 
 
+async def get_topic_id(user_id: int) -> Optional[int]:
+    """Топик заявки клиента, если он уже есть (без создания)."""
+    return (await _load()).get(user_id)
+
+
 async def get_user_id(topic_id: int) -> Optional[int]:
     """Look up which user a support-group topic belongs to."""
     cache = await _load()
@@ -55,9 +61,9 @@ async def forget_topic(user_id: int) -> None:
 
 async def build_user_card(user_id: int, full_name: str, username: str | None) -> str:
     """Info card text for a user: Telegram identity + subscription info from the Remnawave panel."""
-    username_line = f"@{username}" if username else "не указан"
+    username_line = f"@{escape(username)}" if username else "не указан"
     card_lines = [
-        f"👤 {full_name}",
+        f"👤 {escape(full_name)}",
         f"Username: {username_line}",
         f"ID: <code>{user_id}</code>",
         *await get_panel_lines(user_id),
@@ -78,16 +84,21 @@ async def ensure_topic(bot: Bot, user: User) -> int:
         topic = await bot.create_forum_topic(chat_id=SUPPORT_CHAT_ID, name=topic_name)
         logger.info(f"Created topic {topic.message_thread_id} for user_id={user.id} ({topic_name})")
 
-        text = await build_user_card(user.id, user.full_name, user.username)
-        await bot.send_message(
-            chat_id=SUPPORT_CHAT_ID,
-            message_thread_id=topic.message_thread_id,
-            text=text,
-        )
-
+        # Привязку сохраняем ДО карточки: если карточка упадёт (сеть, разметка),
+        # следующее сообщение клиента не должно создать ещё один топик.
         async with _file_lock:
             cache[user.id] = topic.message_thread_id
             await _save()
+
+        from app.admin_actions import card_keyboard  # локально: admin_actions импортирует этот модуль
+
+        try:
+            text = await build_user_card(user.id, user.full_name, user.username)
+            await bot.send_message(
+                chat_id=SUPPORT_CHAT_ID, message_thread_id=topic.message_thread_id, text=text, reply_markup=card_keyboard()
+            )
+        except Exception:
+            logger.exception(f"Failed to post info card to topic {topic.message_thread_id} for user_id={user.id}")
 
         return topic.message_thread_id
 

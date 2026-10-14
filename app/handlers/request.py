@@ -7,9 +7,12 @@ from aiogram.types import Message, User
 from aiogram.utils.chat_action import ChatActionSender
 from loguru import logger
 
-from app import ai_context, ai_support
+from app import ai_context, ai_support, logs_pipeline
+from app.admin_actions import post_action_card
 from app.ai_support import Attachment
+from app.delivery import send_to_client, send_video_to_client
 from app.handlers.admin import notify_admin_escalation
+from app.media import Video
 from app.settings import SUPPORT_CHAT_ID
 from app.topics import ensure_topic, send_to_topic
 
@@ -39,29 +42,27 @@ class _PendingBurst:
     user: User
     texts: list[str] = field(default_factory=list)
     attachments: list[Attachment] = field(default_factory=list)
+    # Выжимки логов: только в живой запрос к ИИ, не в историю.
+    log_digests: list[str] = field(default_factory=list)
     task: Optional[asyncio.Task] = None
+
+
+@dataclass
+class _Read:
+    text: str
+    attachment: Optional[Attachment] = None
+    log_digest: str = ""
 
 
 _pending: dict[int, _PendingBurst] = {}
 _pending_locks: dict[int, asyncio.Lock] = {}
 
 
-async def _send_to_client(bot: Bot, user_id: int, topic_id: int, text: str) -> bool:
-    """Сообщение клиенту от лица поддержки: в топик (админ видит, что ушло) и
-    копией клиенту, плюс запись в историю диалога."""
-    try:
-        sent = await bot.send_message(chat_id=SUPPORT_CHAT_ID, message_thread_id=topic_id, text=text, parse_mode=None)
-        await bot.copy_message(chat_id=user_id, from_chat_id=SUPPORT_CHAT_ID, message_id=sent.message_id)
-    except Exception:
-        logger.exception(f"Failed to deliver support message to user_id={user_id}")
-        return False
-    await ai_context.append_turn(topic_id, "assistant", text)
-    return True
-
-
 async def _reply_with_ai(burst: _PendingBurst, topic_id: int, text: str) -> None:
     """Ответ ИИ клиенту и, если нужен человек, тег админа в топике."""
-    result = await ai_support.get_ai_answer(topic_id, burst.user.id, text, burst.attachments)
+    result = await ai_support.get_ai_answer(
+        topic_id, burst.user.id, text, burst.attachments, "\n\n".join(burst.log_digests)
+    )
 
     if result is None:
         if await ai_context.should_notify_escalation(topic_id):
@@ -73,7 +74,21 @@ async def _reply_with_ai(burst: _PendingBurst, topic_id: int, text: str) -> None
 
     answer = result.answer.strip() or (_HANDOFF_TEXT if result.escalate else "")
     if answer:
-        await _send_to_client(burst.bot, burst.user.id, topic_id, answer)
+        await send_to_client(burst.bot, burst.user.id, topic_id, answer)
+
+    if result.video in Video.__members__:
+        await send_video_to_client(burst.bot, burst.user.id, topic_id, Video(result.video))
+
+    if result.action != "none":
+        try:
+            await post_action_card(
+                burst.bot, topic_id, burst.user.id, result.action, result.action_days, result.action_summary
+            )
+        except Exception:
+            logger.exception(f"Failed to post action card {result.action} to topic {topic_id}")
+        # Карточка сама по себе требует решения человека — тегаем, как при эскалации.
+        if not result.escalate and await ai_context.should_notify_escalation(topic_id):
+            await notify_admin_escalation(burst.bot, topic_id, "ИИ предлагает действие — карточка выше.")
 
     if result.escalate and await ai_context.should_notify_escalation(topic_id):
         await notify_admin_escalation(burst.bot, topic_id, result.escalate_reason or "ИИ передал вопрос человеку.")
@@ -111,10 +126,20 @@ async def _flush_burst(topic_id: int) -> None:
         logger.exception(f"AI layer failed for user_id={burst.user.id}, message stays admin-only")
 
 
-async def _read_message(message: Message) -> tuple[str, Optional[Attachment]]:
+async def _read_message(message: Message) -> _Read:
     """Текст сообщения для ИИ и вложение, которое модель может прочитать.
-    Нечитаемое (видео, архивы, слишком большие файлы) превращается в пометку."""
+    Логи (файлом или вставленным текстом) превращаются в выжимку; нечитаемое
+    (видео, архивы, слишком большие файлы) — в пометку."""
     text = message.text or message.caption or ""
+
+    if logs_pipeline.is_log_document(message):
+        name = message.document.file_name or "лог"
+        content = await logs_pipeline.read_log_document(message)
+        if content is None:
+            return _Read(f"{text}\n[клиент прислал лог «{name}» — не удалось загрузить]".strip())
+        return _Read(f"{text}\n[клиент прислал лог «{name}», переслан техникам]".strip(), log_digest=logs_pipeline.log_block(name, content))
+    if message.text and logs_pipeline.looks_like_log_text(message.text):
+        return _Read("[клиент вставил лог текстом, переслан техникам]", log_digest=logs_pipeline.log_block("текст", message.text))
 
     source = None
     mime = ""
@@ -122,7 +147,7 @@ async def _read_message(message: Message) -> tuple[str, Optional[Attachment]]:
     if message.photo:
         source, mime, kind = message.photo[-1], "image/jpeg", "фото"  # -1 = наибольшее разрешение
     elif message.voice:
-        return f"{text}\n[клиент прислал голосовое — прослушать нельзя]".strip(), None
+        return _Read(f"{text}\n[клиент прислал голосовое — прослушать нельзя]".strip())
     elif message.document and not message.animation:
         doc_mime = message.document.mime_type or ""
         if doc_mime in _IMAGE_MIME:
@@ -131,22 +156,22 @@ async def _read_message(message: Message) -> tuple[str, Optional[Attachment]]:
             source, mime, kind = message.document, doc_mime, "документ"
         else:
             name = message.document.file_name or "без имени"
-            return f"{text}\n[клиент прислал файл «{name}» — посмотреть нельзя]".strip(), None
+            return _Read(f"{text}\n[клиент прислал файл «{name}» — посмотреть нельзя]".strip())
     elif message.video or message.video_note:
-        return f"{text}\n[клиент прислал видео — посмотреть нельзя]".strip(), None
+        return _Read(f"{text}\n[клиент прислал видео — посмотреть нельзя]".strip())
     elif message.sticker:
-        return f"{text}\n[стикер {message.sticker.emoji or ''}]".strip(), None
+        return _Read(f"{text}\n[стикер {message.sticker.emoji or ''}]".strip())
 
     if source is None:
-        return text, None
+        return _Read(text)
     if (getattr(source, "file_size", 0) or 0) > _MAX_ATTACHMENT_BYTES:
-        return f"{text}\n[клиент прислал слишком большой файл ({kind}) — посмотреть нельзя]".strip(), None
+        return _Read(f"{text}\n[клиент прислал слишком большой файл ({kind}) — посмотреть нельзя]".strip())
     try:
         data = (await message.bot.download(source)).read()
     except Exception:
         logger.exception(f"Failed to download {kind} from user_id={message.from_user.id}")
-        return f"{text}\n[клиент прислал {kind} — не удалось загрузить]".strip(), None
-    return text, Attachment(data=data, mime_type=mime, kind=kind)
+        return _Read(f"{text}\n[клиент прислал {kind} — не удалось загрузить]".strip())
+    return _Read(text, Attachment(data=data, mime_type=mime, kind=kind))
 
 
 async def _queue_for_ai(messages: list[Message]) -> None:
@@ -155,6 +180,13 @@ async def _queue_for_ai(messages: list[Message]) -> None:
     topic_id = await ensure_topic(first.bot, first.from_user)
     read = [await _read_message(m) for m in messages]
 
+    log_messages = [m for m, r in zip(messages, read) if r.log_digest]
+    if log_messages:
+        try:
+            await logs_pipeline.forward_to_logs_topic(first.bot, log_messages, first.from_user, topic_id)
+        except Exception:
+            logger.exception(f"Failed to forward log of user_id={first.from_user.id} to logs topic")
+
     lock = _pending_locks.setdefault(topic_id, asyncio.Lock())
     async with lock:
         burst = _pending.get(topic_id)
@@ -162,11 +194,13 @@ async def _queue_for_ai(messages: list[Message]) -> None:
             burst = _PendingBurst(bot=first.bot, user=first.from_user)
             _pending[topic_id] = burst
 
-        for text, attachment in read:
-            if text:
-                burst.texts.append(text)
-            if attachment is not None and len(burst.attachments) < _MAX_ATTACHMENTS:
-                burst.attachments.append(attachment)
+        for item in read:
+            if item.text:
+                burst.texts.append(item.text)
+            if item.attachment is not None and len(burst.attachments) < _MAX_ATTACHMENTS:
+                burst.attachments.append(item.attachment)
+            if item.log_digest:
+                burst.log_digests.append(item.log_digest)
 
         if burst.task is not None:
             burst.task.cancel()

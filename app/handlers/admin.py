@@ -1,19 +1,28 @@
+from datetime import timedelta
 from html import escape
 from typing import List, Optional
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from loguru import logger
 
-from app import ai_context
+from app import ai_context, quick_replies
+from app.admin_actions import card_keyboard
+from app.delivery import send_to_client
 from app.settings import ADMIN_TAGS, SUPPORT_CHAT_ID
 from app.topics import build_user_card, forget_topic, get_user_id
 
 
 router = Router()
 router.message.filter(F.chat.id == int(SUPPORT_CHAT_ID))
+router.callback_query.filter(F.message.chat.id == int(SUPPORT_CHAT_ID))
+
+# Сколько ИИ молчит в топике после сообщения живого админа: в реальных
+# диалогах ИИ перебивал людей и противоречил им ("удаление устройств не
+# поможет" сразу после совета админа удалить устройства). /start вернёт раньше.
+_HUMAN_TAKEOVER = timedelta(hours=6)
 
 
 async def notify_admin_escalation(bot: Bot, topic_id: int, reason: str) -> None:
@@ -89,6 +98,7 @@ async def handle_refresh_card(message: Message):
         chat_id=SUPPORT_CHAT_ID,
         message_thread_id=message.message_thread_id,
         text=await build_user_card(user_id, chat.full_name, chat.username),
+        reply_markup=card_keyboard(),
     )
 
 
@@ -155,6 +165,70 @@ async def handle_outage(message: Message, command: CommandObject):
     )
 
 
+def _quick_replies_menu() -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(text=command, callback_data=f"qr:{index}")
+        for index, command in enumerate(quick_replies.COMMANDS)
+    ]
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    rows.append([InlineKeyboardButton(text="✖️ Закрыть", callback_data="qr:close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(Command("q"))
+async def handle_quick_menu(message: Message):
+    """Меню быстрых ответов кнопками: нажатие отправляет текст клиенту этого топика."""
+    if await _topic_of_request(message) is None:
+        return
+    if not quick_replies.COMMANDS:
+        await message.reply("Быстрые ответы не загружены (нет kb/quick-replies.md).")
+        return
+    await message.reply("Быстрые ответы — нажмите, чтобы отправить клиенту:", reply_markup=_quick_replies_menu())
+
+
+@router.callback_query(F.data.startswith("qr:"))
+async def on_quick_reply(callback: CallbackQuery):
+    choice = callback.data.removeprefix("qr:")
+    if choice == "close":
+        await callback.message.delete()
+        await callback.answer()
+        return
+    topic_id = callback.message.message_thread_id
+    user_id = await get_user_id(topic_id) if topic_id else None
+    index = int(choice)
+    if user_id is None or index >= len(quick_replies.COMMANDS):
+        await callback.answer("Не удалось определить клиента.", show_alert=True)
+        return
+    text = quick_replies.QUICK_REPLIES[quick_replies.COMMANDS[index]]
+    await callback.message.delete()
+    if await send_to_client(callback.bot, user_id, topic_id, text, staff=True):
+        await ai_context.pause_ai(topic_id, _HUMAN_TAKEOVER)
+        await callback.answer("Отправлено")
+    else:
+        await callback.answer("Не удалось доставить клиенту", show_alert=True)
+
+
+@router.message(F.is_topic_message, F.text.startswith("/"))
+async def handle_slash_in_topic(message: Message):
+    """Быстрый ответ по команде ("/регион"). Неизвестные команды клиенту не
+    пересылаются — раньше опечатка в команде уходила клиенту как текст."""
+    user_id = await get_user_id(message.message_thread_id)
+    if user_id is None:
+        return
+    text = quick_replies.find(message.text)
+    if text is None:
+        await message.reply("Нет такой команды. Быстрые ответы: /q")
+        return
+    if await send_to_client(message.bot, user_id, message.message_thread_id, text, staff=True):
+        await ai_context.pause_ai(message.message_thread_id, _HUMAN_TAKEOVER)
+        try:
+            await message.delete()  # в топике остаётся только сам текст, ушедший клиенту
+        except Exception:
+            pass
+    else:
+        await message.reply("Не удалось доставить сообщение клиенту.")
+
+
 async def _notify_delivery_failure(message: Message, user_id: int, error: Exception) -> None:
     if isinstance(error, TelegramForbiddenError):
         logger.warning(f"Could not deliver reply to user_id={user_id}: bot is blocked")
@@ -184,7 +258,8 @@ async def forward_admin_album(message: Message, album: Optional[List[Message]] =
         await _notify_delivery_failure(message, user_id, error)
         return
 
-    await ai_context.append_turn(message.message_thread_id, "assistant", message.caption or "[медиа]")
+    await ai_context.append_turn(message.message_thread_id, "assistant", f"[сотрудник] {message.caption or '[медиа]'}")
+    await ai_context.pause_ai(message.message_thread_id, _HUMAN_TAKEOVER)
 
 
 @router.message(F.is_topic_message, F.forum_topic_created.is_(None))
@@ -201,5 +276,6 @@ async def forward_admin_message(message: Message):
         return
 
     await ai_context.append_turn(
-        message.message_thread_id, "assistant", message.text or message.caption or "[медиа]"
+        message.message_thread_id, "assistant", f"[сотрудник] {message.text or message.caption or '[медиа]'}"
     )
+    await ai_context.pause_ai(message.message_thread_id, _HUMAN_TAKEOVER)

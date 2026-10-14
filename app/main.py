@@ -6,7 +6,7 @@ from loguru import logger
 
 from app.settings import TOKEN
 from app.handlers import router, set_commands
-from app.middlewares import AlbumMiddleware, DeduplicationMiddleware
+from app.middlewares import AlbumMiddleware, DeduplicationMiddleware, RetryAfterMiddleware
 from app.logging_config import setup_logging
 
 
@@ -18,6 +18,7 @@ async def main():
         token=TOKEN,
         default=DefaultBotProperties(parse_mode='HTML')
     )
+    bot.session.middleware(RetryAfterMiddleware())
 
     dp = Dispatcher()
     dp.update.middleware(DeduplicationMiddleware())

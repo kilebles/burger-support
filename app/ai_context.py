@@ -46,6 +46,13 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS bonuses (
+    user_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    days INTEGER NOT NULL,
+    granted_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (user_id, kind, granted_at)
+);
 CREATE TABLE IF NOT EXISTS outage_contacts (
     user_id INTEGER PRIMARY KEY,
     label TEXT NOT NULL,
@@ -65,9 +72,26 @@ async def _conn() -> aiosqlite.Connection:
                 DATA_DIR.mkdir(parents=True, exist_ok=True)
                 db = await aiosqlite.connect(DB_FILE)
                 await db.executescript(_SCHEMA)
+                await _migrate(db)
                 await db.commit()
                 _db = db
     return _db
+
+
+async def _migrate(db: aiosqlite.Connection) -> None:
+    """Колонки, добавленные после первого деплоя (SQLite не умеет ADD COLUMN IF NOT EXISTS)."""
+    async with db.execute("PRAGMA table_info(topics)") as cur:
+        columns = {row[1] for row in await cur.fetchall()}
+    if "paused_until" not in columns:
+        await db.execute("ALTER TABLE topics ADD COLUMN paused_until TEXT")
+
+
+async def get_setting(key: str) -> Optional[str]:
+    return await _get_setting(key)
+
+
+async def set_setting(key: str, value: Optional[str]) -> None:
+    await _set_setting(key, value)
 
 
 async def _get_setting(key: str) -> Optional[str]:
@@ -91,21 +115,56 @@ async def _set_setting(key: str, value: Optional[str]) -> None:
 
 
 async def is_ai_enabled(topic_id: int) -> bool:
-    """ИИ включён по умолчанию в новом топике, пока явно не остановлен /stop."""
+    """ИИ включён по умолчанию в новом топике, пока явно не остановлен /stop
+    и пока в топике не отвечает живой админ (см. pause_ai)."""
     db = await _conn()
-    async with db.execute("SELECT enabled FROM topics WHERE topic_id = ?", (topic_id,)) as cur:
+    async with db.execute("SELECT enabled, paused_until FROM topics WHERE topic_id = ?", (topic_id,)) as cur:
         row = await cur.fetchone()
-    return True if row is None else bool(row[0])
+    if row is None:
+        return True
+    enabled, paused_until = row
+    if paused_until and datetime.fromisoformat(paused_until) > datetime.now(timezone.utc):
+        return False
+    return bool(enabled)
 
 
 async def set_ai_enabled(topic_id: int, enabled: bool) -> None:
+    """/stop и /start. /start заодно снимает паузу из-за ответа админа."""
     db = await _conn()
     await db.execute(
-        "INSERT INTO topics (topic_id, enabled) VALUES (?, ?) "
-        "ON CONFLICT (topic_id) DO UPDATE SET enabled = excluded.enabled",
+        "INSERT INTO topics (topic_id, enabled, paused_until) VALUES (?, ?, NULL) "
+        "ON CONFLICT (topic_id) DO UPDATE SET enabled = excluded.enabled, paused_until = NULL",
         (topic_id, int(enabled)),
     )
     await db.commit()
+
+
+async def pause_ai(topic_id: int, duration: timedelta) -> None:
+    """Живой админ взял диалог: ИИ молчит в топике, чтобы не перебивать и не
+    противоречить человеку (в реальных диалогах это была частая жалоба)."""
+    until = (datetime.now(timezone.utc) + duration).isoformat()
+    db = await _conn()
+    await db.execute(
+        "INSERT INTO topics (topic_id, paused_until) VALUES (?, ?) "
+        "ON CONFLICT (topic_id) DO UPDATE SET paused_until = excluded.paused_until",
+        (topic_id, until),
+    )
+    await db.commit()
+
+
+async def add_bonus(user_id: int, kind: str, days: int) -> None:
+    db = await _conn()
+    await db.execute("INSERT INTO bonuses (user_id, kind, days) VALUES (?, ?, ?)", (user_id, kind, days))
+    await db.commit()
+
+
+async def get_bonuses(user_id: int) -> list[tuple[str, int, str]]:
+    """Бонусы, выданные клиенту через кнопки в топике: (вид, дни, когда)."""
+    db = await _conn()
+    async with db.execute(
+        "SELECT kind, days, granted_at FROM bonuses WHERE user_id = ? ORDER BY granted_at", (user_id,)
+    ) as cur:
+        return [tuple(row) for row in await cur.fetchall()]
 
 
 async def is_ai_globally_enabled() -> bool:

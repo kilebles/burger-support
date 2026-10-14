@@ -75,3 +75,10 @@ Thumbs.db
 result.json
 *.pdf
 kb/
+
+# Instruction videos and raw uploads (large binaries, deployed separately)
+media/
+*.MP4
+*.mp4
+# Quick replies contain a service subscription link
+quick-replies.md
