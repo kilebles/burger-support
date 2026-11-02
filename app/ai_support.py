@@ -195,11 +195,20 @@ def _get_routes() -> list[_ProviderRoute]:
 
 _BILLING_ERROR_MARKERS = (
     "credit balance is too low",
+    "insufficient balance",
     "insufficient_balance",
     "insufficient_quota",
+    "payment required",
     "invalid_api_key",
     "api_key_revoked",
 )
+
+
+def _is_billing_or_auth_error(exc: APIError) -> bool:
+    if getattr(exc, "status_code", None) in (401, 402):
+        return True
+    err_lower = str(exc).lower()
+    return any(m in err_lower for m in _BILLING_ERROR_MARKERS)
 
 _TRAILING_JSON_DEBRIS = re.compile(r"""[\s"'{}\[\],]+$""")
 
@@ -416,8 +425,7 @@ async def get_ai_answer(
                 tool_choice={"type": "tool", "name": "submit_answer"},
             )
         except APIError as exc:
-            err_lower = str(exc).lower()
-            if any(m in err_lower for m in _BILLING_ERROR_MARKERS):
+            if _is_billing_or_auth_error(exc):
                 dead_billing_groups.add(active_route.billing_group)
                 live = [i for i, r in enumerate(routes) if r.billing_group not in dead_billing_groups]
                 if not live:
@@ -434,12 +442,16 @@ async def get_ai_answer(
                 f"AI API error on {active_route.billing_group}/{active_route.model} "
                 f"(attempt {attempt}/{MAX_RETRIES}): {exc}"
             )
-            live_others = [
-                i for i, r in enumerate(routes)
-                if i != route_idx and r.billing_group not in dead_billing_groups
-            ]
-            if live_others:
-                route_idx = live_others[0]
+            next_idx = next(
+                (
+                    idx
+                    for offset in range(1, len(routes))
+                    if routes[(idx := (route_idx + offset) % len(routes))].billing_group not in dead_billing_groups
+                ),
+                None,
+            )
+            if next_idx is not None:
+                route_idx = next_idx
                 logger.info(f"Switching to fallback AI route {routes[route_idx].billing_group}/{routes[route_idx].model}")
             else:
                 await asyncio.sleep(attempt * 2)
