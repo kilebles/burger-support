@@ -13,9 +13,13 @@ class Settings(BaseSettings):
     remnawave_url: str = ""
     remnawave_token: str = ""
     remnawave_cookie: str = ""
+    gpuniq_api_key: str = ""
+    gpuniq_base_url: str = "https://api.gpuniq.com"
     anthropic_api_key: str = ""
-    ai_model: str = "claude-sonnet-5"
-    admin_tags: str = ""
+    ai_model: str = "gpt-6-luna"
+    ai_fallback_model: str = "gemini-3-flash"
+    anthropic_fallback_model: str = "claude-haiku-4-5-20251001"
+    admin_tags: str = "@asradyuk"
 
     class Config:
         env_file = BASE_DIR / ".env"
@@ -28,6 +32,10 @@ SUPPORT_CHAT_ID = config.support_chat_id
 REMNAWAVE_URL = config.remnawave_url
 REMNAWAVE_TOKEN = config.remnawave_token
 REMNAWAVE_COOKIE = config.remnawave_cookie
+GPUNIQ_API_KEY = config.gpuniq_api_key
+GPUNIQ_BASE_URL = config.gpuniq_base_url
 ANTHROPIC_API_KEY = config.anthropic_api_key
 AI_MODEL = config.ai_model
+AI_FALLBACK_MODEL = config.ai_fallback_model
+ANTHROPIC_FALLBACK_MODEL = config.anthropic_fallback_model
 ADMIN_TAGS = config.admin_tags

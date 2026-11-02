@@ -1,22 +1,36 @@
 import asyncio
 import base64
 import html
+import io
+import json
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 from anthropic import APIError, AsyncAnthropic
 from loguru import logger
 from pydantic import BaseModel, ValidationError
+from pypdf import PdfReader
 
 from app import ai_context
 from app.media import Video
 from app.remnawave import get_panel_lines
-from app.settings import AI_MODEL, ANTHROPIC_API_KEY, BASE_DIR
+from app.settings import (
+    AI_FALLBACK_MODEL,
+    AI_MODEL,
+    ANTHROPIC_API_KEY,
+    ANTHROPIC_FALLBACK_MODEL,
+    BASE_DIR,
+    GPUNIQ_API_KEY,
+    GPUNIQ_BASE_URL,
+)
 
 KB_FILE = BASE_DIR / "kb" / "knowledge.md"
 
 MAX_RETRIES = 3
+MAX_OUTPUT_TOKENS = 1200
+_MAX_PDF_TEXT_CHARS = 4000
+_MAX_PDF_IMAGE_BYTES = 5 * 1024 * 1024
 
 
 @dataclass
@@ -46,8 +60,9 @@ class SupportAnswer(BaseModel):
     action_summary: str = ""
 
 
-# JSON-схема ответа для output_config.format — плоская, с additionalProperties=false,
-# как требует structured outputs. Поля обязаны совпадать с SupportAnswer.
+# JSON-схема ответа — плоская, с additionalProperties=false.
+# Передаётся через принудительный tool_choice (submit_answer), так как
+# GPUniq /v1/messages поддерживает tools/tool_choice, но игнорирует output_config.
 _ANSWER_SCHEMA = {
     "type": "object",
     "properties": {
@@ -68,19 +83,25 @@ _ANSWER_SCHEMA = {
     "additionalProperties": False,
 }
 
+_SUBMIT_ANSWER_TOOL = {
+    "name": "submit_answer",
+    "description": "Отправить структурированный ответ клиенту и/или передать вопрос сотруднику.",
+    "input_schema": _ANSWER_SCHEMA,
+}
+
 SYSTEM_PROMPT_TEMPLATE = """Ты — первая линия поддержки Burger VPN, отвечаешь клиентам в Telegram от имени поддержки.
 
 Правила:
 - Пиши от лица команды поддержки ("мы"). По своей инициативе не упоминай, что ты ИИ, бот или ассистент, не ссылайся на "базу знаний", "инструкцию для поддержки" или процесс генерации ответа. Если клиент прямо спрашивает, бот ли ты — не ври: коротко подтверди, что на первой линии отвечает автоматический помощник, а сложные вопросы разбирают живые сотрудники, и вернись к сути.
 - Отвечай на языке клиента (обычно русский). Тон — как в разделе "Примеры живых ответов поддержки": на "вы", доброжелательно, коротко, без канцелярита и технического жаргона. Уместно редкое 🙏 или 🫶.
 - Используй только информацию из базы знаний ниже и из блоков данных в сообщении. Не придумывай кнопки, функции, ссылки, сроки, цены и правила, которых там нет.
-- Главная задача — выяснить причину. Если данных не хватает, не гадай: запроси нужное по разделу базы (что не работает, Wi‑Fi или мобильный, регион и оператор, приложение, скрин списка серверов, лог Happ, скрин оплаты). Не спрашивай то, что клиент уже сообщил или что видно на его скрине или в блоке данных подписки.
+- Главная задача — выяснить причину. Если данных не хватает, не гадай: запроси нужное по разделу базы (что не работает, Wi‑Fi или мобильный, регион и оператор, приложение, скрин списка серверов, скрин оплаты). Никогда не проси клиента присылать логи из приложения. Не спрашивай то, что клиент уже сообщил или что видно на его скрине или в блоке данных подписки.
 - Когда причина ещё не ясна — задай уточняющий вопрос или дай один шаг и жди ответа. Не добавляй заранее план "а если не поможет, тогда сделайте...": один вопрос или один шаг — дальше по ответу клиента. Полный многошаговый список уместен только для готовой, точно применимой процедуры (например, как подключить новое устройство).
-- Не повторяй совет, который уже давал в этом диалоге и который не помог: предложи следующий шаг по чек-листу или передай человеку.
+- Не повторяй совет, который уже давал в этом диалоге и который не помог: предложи следующий шаг по чек-листу. Когда обычные шаги (обновление подписки, смена сервера/обхода, проверка без VPN) не помогают — предложи перезагрузить устройство (телефон или компьютер) и попробовать подключиться снова. Если вообще тупик и не пингуются/не работают ни «Обход глушилок», ни обычные серверы — попроси проверить подключение с другой сети (с Wi‑Fi на мобильный или наоборот) или на другом устройстве в той же сети: если с другой сети на том же устройстве всё работает — дело в операторе/провайдере; если на другом устройстве в той же сети всё работает — проблема локально на стороне устройства клиента (конфликт профилей VPN/DNS, сетевые настройки). Передавай человеку только если это не помогло.
 - Ты ничего не меняешь в системе: не начисляешь и не переносишь дни, не удаляешь устройства за клиента, не выдаёшь новые ссылки, не разблокируешь, не делаешь возвраты и компенсации. Никогда не пиши, что это уже сделано или точно будет сделано, и не называй сроки и количество дней компенсации.
-- escalate=true ставь, когда нужен человек: действие из списка выше, вопрос возврата или списания денег, блокировка, баг бота или оплаты, серверы не работают после чек-листа и лог собран, B2B/реклама/юридические вопросы, клиент в конфликте и не принимает объяснение, или ты не уверен в ответе. Перед передачей сначала собери данные из таблицы "Эскалация" — если чего-то не хватает, escalate=false и попроси недостающее. escalate_reason — одно предложение на русском для админа: суть проблемы и что уже собрано.
+- escalate=true ставь, когда нужен человек: действие из списка выше, вопрос возврата или списания денег, блокировка, баг бота или оплаты, серверы не работают после чек-листа и перезагрузки устройства, B2B/реклама/юридические вопросы, клиент в конфликте и не принимает объяснение, или ты не уверен в ответе. Перед передачей сначала собери данные из таблицы "Эскалация" — если чего-то не хватает, escalate=false и попроси недостающее. escalate_reason — одно предложение на русском для админа: суть проблемы и что уже собрано.
 - answer всегда уходит клиенту как есть. При escalate=true answer — короткое сообщение о передаче без сроков и обещаний (как в шаблоне "Клиенту при передаче").
-- Блок "Текущий статус сервиса" в сообщении — сообщение от команды о массовом сбое. Если там указан сбой, действуй по разделам 1.1/1.2: не гоняй клиента по чек-листу, не проси логи и не пиши "обновите подписку" — ответь шаблоном про технические работы своими словами с учётом описания.
+- Блок "Текущий статус сервиса" в сообщении — сообщение от команды о массовом сбое. Если там указан сбой, действуй по разделам 1.1/1.2: не гоняй клиента по чек-листу и не пиши "обновите подписку" — ответь шаблоном про технические работы своими словами с учётом описания.
 - Блок "Данные подписки клиента" — свежие данные из панели, а не слова клиента: статус, срок, трафик, устройства, последнее подключение, последний сервер, приложение, ссылка подписки. Используй их для диагностики (статус "истекла" или "лимит трафика исчерпан" — вот и причина; "не подключался" — подписка не добавлена в приложение; давно не обновлял подписку — обновить), но не пересказывай клиенту весь блок и упоминай только то, что прямо относится к вопросу. Не говори "панель", "система", "слоты" — просто "вижу, что у вас...". Если клиента нет в панели — попроси юзернейм или Telegram ID, с которого покупал. Ссылку подписки можно прислать клиенту, когда по базе нужно добавить подписку в приложение. "Последняя нода" — внутреннее имя сервера: клиенту его не называй, говори о разделах из приложения ("Авто", страна, "Обход глушилок").
 - Лимит устройств НЕ влияет на работу уже подключённых устройств. Он мешает только добавить или обновить подписку на новом устройстве: признаки — "превышен лимит устройств", пустой список серверов, только сервер "Поддержка", "обновите/оплатите подписку" при активных днях. Если серверы в приложении видны, но показывают n/a, не подключаются или не грузят сайты — это НЕ лимит устройств, не упоминай его, иди по разделам 1.3/1.4 и чек-листу. Занятые 5 из 5 устройств — нормальная ситуация, а не проблема.
 - Вложения: клиент может прислать скриншот, фото или PDF (например, чек). Разбирай их так же, как это делает поддержка: по скрину определи приложение, устройство, видны ли серверы, их пинг, дату обновления подписки, ошибку; по чеку — сумму, дату, банк. В attachment_note одним коротким предложением опиши вложение для истории (например, "скрин Happ: серверы видны, все n/a, подписка обновлена 12.09" или "чек СБП на 299 ₽ от 30.09"); без вложения — пустая строка.
@@ -92,9 +113,9 @@ SYSTEM_PROMPT_TEMPLATE = """Ты — первая линия поддержки 
 - Никогда не говори клиенту, что какое-то правило "не зафиксировано" или "не описано" — это внутреннее. Если не знаешь ответа, скажи, что уточнишь у коллег, и передай человеку.
 - Пиши о себе в мужском роде ("передал", "проверил", "рад"), всегда одинаково.
 - Реплики в истории с пометкой "[сотрудник]" написал живой сотрудник поддержки. Никогда не противоречь ему и не отменяй его советы ("удаление устройств не поможет" после совета сотрудника удалить устройства — недопустимо). Продолжай в его русле; если не согласен с фактами — escalate=true и напиши об этом в escalate_reason, клиенту — нейтрально.
-- Не повторяй одну и ту же просьбу (лог, регион, скрин) больше двух раз за диалог: если клиент не может или не хочет это прислать — работай с тем, что есть, или передай человеку. Не повторяй "передал коллегам", если уже говорил это в последних репликах и ничего нового не произошло — на "ну что там?" ответь, что вопрос у сотрудников, без повторной передачи (escalate=false).
+- Не повторяй одну и ту же просьбу (регион, скрин) больше двух раз за диалог: если клиент не может или не хочет это прислать — работай с тем, что есть, или передай человеку. Не повторяй "передал коллегам", если уже говорил это в последних репликах и ничего нового не произошло — на "ну что там?" ответь, что вопрос у сотрудников, без повторной передачи (escalate=false).
 - Если клиент просит вернуть деньги — сначала ответь именно про возврат (раздел 2.5): спроси причину, тариф и дату оплаты, передай человеку. Не отвечай на запрос возврата чек-листом диагностики.
-- Лимит трафика: называй только цифры из блока "Данные подписки клиента" (сколько израсходовано и сколько всего). Не объясняй, на какие серверы действует лимит, сбрасывается ли он при продлении и сколько ГБ положено по тарифу — такой вопрос передай человеку (клиенту: "уточню у коллег"). Сервер "Поддержка" в списке — это признак незагруженной подписки, а не отдельный сервер.
+- Лимит трафика: действует только на серверы "Обход глушилок", обычные иностранные серверы безлимитны (см. раздел 5.1). Точный расход и лимит конкретного клиента бери из блока "Данные подписки клиента". Докупить дополнительные гигабайты клиент может самостоятельно в боте @VpnBurger_bot → «Управление подпиской» (после докупки нужно обновить подписку в приложении). Эскалируй только если кнопка докупки пропала или после оплаты ГБ не начислились. Сервер "Поддержка" в списке — это признак незагруженной подписки, а не отдельный сервер.
 - Пробный период и автопродление: не говори, продлевается ли пробный период автоматически и сколько он стоит. Как отключить автопродление — раздел 2.4.
 - Не пиши, что "напомнил админу", "проверил в системе" и т.п. — у тебя нет таких действий.
 
@@ -107,15 +128,78 @@ SYSTEM_PROMPT_TEMPLATE = """Ты — первая линия поддержки 
 - reset_devices — клиенту нужно удалить все устройства (лимит, чужой подключился), а сам в боте он не справляется. action_days=0.
 - Во всех остальных случаях — "none", action_days=0. action_summary — одно-два предложения для сотрудника: что прислал клиент, что проверено, что смущает.
 
-Логи: если в сообщении есть "[выжимка лога клиента ...]" — это значимые строки лога, собранные кодом (полный файл уже у техников). Разбери её: "Tunnel stopped ... userInitiated" без ошибок до этого — клиент выключил VPN перед снятием лога, попроси снять заново, не выключая VPN; ошибки подключения (refused, timeout, failed to dial, tls/handshake) на серверах из списка — передай техникам (escalate=true), в escalate_reason коротко суть ошибок и регион/оператор, если известны. Если лог уже был получен в этом диалоге — не проси его снова.
+Логи: сам логи никогда не запрашивай. Если клиент по своей инициативе прислал лог и в сообщении есть "[выжимка лога клиента ...]" — учти её при ответе и при наличии ошибок подключения передай техникам (escalate=true).
+ФОРМАТ ВЫВОДА (КРИТИЧНО): для отправки любого ответа ОБЯЗАТЕЛЬНО вызывай инструмент submit_answer со всеми обязательными полями схемы. Никогда не отвечай обычным текстом и не пиши никакой сопроводительный текст вне аргументов инструмента submit_answer.
 
 ===== БАЗА ЗНАНИЙ =====
 {kb}
+
+ВАЖНО: в истории диалога прошлые ответы сохранены просто текстом для компактности, но твой новый ответ ВСЕГДА должен отправляться только через вызов инструмента submit_answer (не обычным текстом).
 """
 
 SYSTEM_PROMPT = SYSTEM_PROMPT_TEMPLATE.format(kb=KB_FILE.read_text(encoding="utf-8"))
 
-_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+
+@dataclass(frozen=True)
+class _ProviderRoute:
+    client: AsyncAnthropic
+    model: str
+    billing_group: str
+
+
+def _build_clients() -> tuple[Optional[AsyncAnthropic], Optional[AsyncAnthropic]]:
+    primary: Optional[AsyncAnthropic] = None
+    fallback: Optional[AsyncAnthropic] = None
+    if GPUNIQ_API_KEY:
+        primary = AsyncAnthropic(api_key=GPUNIQ_API_KEY, base_url=GPUNIQ_BASE_URL)
+    if ANTHROPIC_API_KEY:
+        client = (
+            AsyncAnthropic(api_key=ANTHROPIC_API_KEY, base_url=GPUNIQ_BASE_URL)
+            if ANTHROPIC_API_KEY.startswith("gpuniq_")
+            else AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        )
+        if primary is None:
+            primary = client
+        elif not ANTHROPIC_API_KEY.startswith("gpuniq_"):
+            fallback = client
+    return primary, fallback
+
+
+_client, _fallback_client = _build_clients()
+_primary_is_gpuniq = bool(GPUNIQ_API_KEY or ANTHROPIC_API_KEY.startswith("gpuniq_"))
+_initial_client = _client
+
+
+def _get_routes() -> list[_ProviderRoute]:
+    """Цепочка маршрутов: основная модель GPUniq -> резервная модель GPUniq -> прямой Anthropic."""
+    if _client is None:
+        return []
+    # Если _client подменён в тестах — вызываем только его.
+    if _client is not _initial_client:
+        return [_ProviderRoute(client=_client, model=AI_MODEL, billing_group="mock")]
+
+    routes: list[_ProviderRoute] = []
+    if _primary_is_gpuniq:
+        routes.append(_ProviderRoute(client=_client, model=AI_MODEL, billing_group="gpuniq"))
+        if AI_FALLBACK_MODEL and AI_FALLBACK_MODEL != AI_MODEL:
+            routes.append(_ProviderRoute(client=_client, model=AI_FALLBACK_MODEL, billing_group="gpuniq"))
+    else:
+        direct_model = AI_MODEL if AI_MODEL.startswith("claude-") else ANTHROPIC_FALLBACK_MODEL
+        routes.append(_ProviderRoute(client=_client, model=direct_model, billing_group="anthropic"))
+
+    if _fallback_client is not None:
+        routes.append(
+            _ProviderRoute(client=_fallback_client, model=ANTHROPIC_FALLBACK_MODEL, billing_group="anthropic")
+        )
+    return routes
+
+_BILLING_ERROR_MARKERS = (
+    "credit balance is too low",
+    "insufficient_balance",
+    "insufficient_quota",
+    "invalid_api_key",
+    "api_key_revoked",
+)
 
 _TRAILING_JSON_DEBRIS = re.compile(r"""[\s"'{}\[\],]+$""")
 
@@ -165,11 +249,82 @@ async def _panel_block(telegram_id: int) -> str:
     return text or "нет данных (панель недоступна)"
 
 
-def _attachment_block(attachment: Attachment) -> dict:
-    data = base64.standard_b64encode(attachment.data).decode("ascii")
+def _detect_image_mime(data: bytes) -> Optional[str]:
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def extract_pdf_payload(data: bytes) -> tuple[str, Optional[tuple[bytes, str]]]:
+    """Извлечь текст из цифрового PDF-чека (Сбер, Т-Банк, Альфа, СБП и др.),
+    а для сканов без текстового слоя — попробовать достать встроенное изображение."""
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        pages_text = [(page.extract_text() or "").strip() for page in reader.pages[:5]]
+        extracted = "\n".join(p for p in pages_text if p).strip()
+        if extracted:
+            return extracted[:_MAX_PDF_TEXT_CHARS], None
+
+        for page in reader.pages[:2]:
+            for img in getattr(page, "images", ()):
+                img_bytes = getattr(img, "data", b"")
+                mime = _detect_image_mime(img_bytes) if img_bytes else None
+                if mime and len(img_bytes) <= _MAX_PDF_IMAGE_BYTES:
+                    return "", (img_bytes, mime)
+    except Exception as exc:
+        logger.warning(f"Failed to parse PDF attachment: {exc}")
+    return "", None
+
+
+def _attachment_blocks(attachment: Attachment) -> list[dict]:
+    """Представление вложения для LLM. GPUniq /v1/messages игнорирует блоки
+    type='document' (PDF), поэтому PDF-чеки передаём извлечённым текстом (~80 токенов
+    вместо тысяч и 100% совместимость со всеми моделями) или встроенной картинкой."""
     if attachment.mime_type == "application/pdf":
-        return {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": data}}
-    return {"type": "image", "source": {"type": "base64", "media_type": attachment.mime_type, "data": data}}
+        pdf_text, embedded_image = extract_pdf_payload(attachment.data)
+        if pdf_text:
+            return [{"type": "text", "text": f"[Содержимое прикреплённого PDF-документа]:\n{pdf_text}"}]
+        if embedded_image is not None:
+            img_bytes, img_mime = embedded_image
+            b64 = base64.standard_b64encode(img_bytes).decode("ascii")
+            return [{"type": "image", "source": {"type": "base64", "media_type": img_mime, "data": b64}}]
+        return [
+            {
+                "type": "text",
+                "text": (
+                    "[Клиент прислал сканированный PDF-документ без текстового слоя — "
+                    "вежливо попроси прислать обычный скриншот этого документа/чека]"
+                ),
+            }
+        ]
+    data = base64.standard_b64encode(attachment.data).decode("ascii")
+    return [{"type": "image", "source": {"type": "base64", "media_type": attachment.mime_type, "data": data}}]
+
+
+def _normalize_history(history: list[dict[str, str]]) -> tuple[list[dict[str, str]], str]:
+    """Склеить подряд идущие реплики одной роли (возникают при паузах ИИ или
+    no_reply_needed), чтобы история строго чередовала user/assistant.
+    Если история заканчивается репликой user без ответа — возвращаем её отдельно
+    для объединения с текущим сообщением клиента."""
+    merged: list[dict[str, str]] = []
+    for turn in history:
+        content = (turn.get("content") or "").strip()
+        if not content:
+            continue
+        role = turn["role"]
+        if merged and merged[-1]["role"] == role:
+            merged[-1]["content"] = f"{merged[-1]['content']}\n\n{content}"
+        else:
+            merged.append({"role": role, "content": content})
+
+    trailing_user = ""
+    if merged and merged[-1]["role"] == "user":
+        trailing_user = merged.pop()["content"]
+    return merged, trailing_user
 
 
 def _history_entry(text: str, attachments: list[Attachment], note: str) -> str:
@@ -187,79 +342,176 @@ async def get_ai_answer(
     text: str,
     attachments: list[Attachment],
     extra_context: str = "",
+    *,
+    on_commit: Optional[Callable[[], None]] = None,
 ) -> Optional[SupportAnswer]:
     """Ответ ИИ на пачку сообщений клиента. Реплика клиента записывается в
     историю в любом случае; ответ ИИ — вызывающим кодом, только если он реально
     ушёл клиенту. extra_context (выжимки логов) уходит только в этот запрос и
     в историю не пишется — иначе каждый следующий ход тянул бы его заново.
     None — модель так и не дала пригодный ответ."""
-    if _client is None:
-        raise RuntimeError("ANTHROPIC_API_KEY не задан в .env")
+    routes = _get_routes()
+    if not routes:
+        raise RuntimeError("GPUNIQ_API_KEY / ANTHROPIC_API_KEY не задан в .env")
 
-    history = await ai_context.get_history(topic_id)
+    raw_history = await ai_context.get_history(topic_id)
+    history, trailing_user = _normalize_history(raw_history)
     outage = await ai_context.get_outage()
 
     bonuses = await ai_context.get_bonuses(telegram_id)
     bonuses_text = ", ".join(f"{kind} +{days} дн. ({at[:10]})" for kind, days, at in bonuses) or "нет"
+    combined_client_text = (
+        f"{trailing_user}\n\n{text}".strip() if trailing_user else text
+    ) or "[без текста, только вложение]"
     context = (
         f"Текущий статус сервиса: {outage or 'массового сбоя нет'}\n\n"
         f"Данные подписки клиента:\n{await _panel_block(telegram_id)}\n\n"
         f"Выданные бонусы: {bonuses_text}\n\n"
-        f"Сообщение клиента:\n{text or '[без текста, только вложение]'}"
+        f"Сообщение клиента:\n{combined_client_text}"
         + (f"\n\n{extra_context}" if extra_context else "")
     )
+    # Инкрементальный breakpoint на последней реплике истории: следующий ход
+    # в том же топике читает весь предыдущий диалог из кэша.
+    messages: list[dict] = []
+    for i, turn in enumerate(history):
+        if i == len(history) - 1:
+            messages.append(
+                {
+                    "role": turn["role"],
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": turn["content"],
+                            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                        }
+                    ],
+                }
+            )
+        else:
+            messages.append({"role": turn["role"], "content": turn["content"]})
+
     # Вложения перед текстом — так рекомендует Anthropic. cache_control на
-    # последнем блоке: следующий ход читает этот, включая картинки, из кэша.
-    content: list[dict] = [_attachment_block(a) for a in attachments]
+    # последнем блоке кэширует текущий ход при локальных ретраях.
+    content: list[dict] = []
+    for attachment in attachments:
+        content.extend(_attachment_blocks(attachment))
     content.append({"type": "text", "text": context, "cache_control": {"type": "ephemeral", "ttl": "1h"}})
-    messages: list[dict] = [{"role": t["role"], "content": t["content"]} for t in history]
     messages.append({"role": "user", "content": content})
 
+    dead_billing_groups: set[str] = set()
+    route_idx = 0
+
     result: Optional[SupportAnswer] = None
-    for attempt in range(1, MAX_RETRIES + 1):
+    attempt = 1
+    while attempt <= MAX_RETRIES:
+        active_route = routes[route_idx]
         try:
-            response = await _client.messages.create(
-                model=AI_MODEL,
-                max_tokens=16000,
-                # Как в support-x: thinking выключен, формат гарантирует json_schema,
-                # effort=medium — на high модель уходила в долгие размышления.
+            response = await active_route.client.messages.create(
+                model=active_route.model,
+                max_tokens=MAX_OUTPUT_TOKENS,
                 thinking={"type": "disabled"},
                 system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
                 messages=messages,
-                output_config={"effort": "medium", "format": {"type": "json_schema", "schema": _ANSWER_SCHEMA}},
+                tools=[_SUBMIT_ANSWER_TOOL],
+                tool_choice={"type": "tool", "name": "submit_answer"},
             )
         except APIError as exc:
-            logger.warning(f"Anthropic API error (attempt {attempt}/{MAX_RETRIES}): {exc}")
-            await asyncio.sleep(attempt * 2)
+            err_lower = str(exc).lower()
+            if any(m in err_lower for m in _BILLING_ERROR_MARKERS):
+                dead_billing_groups.add(active_route.billing_group)
+                live = [i for i, r in enumerate(routes) if r.billing_group not in dead_billing_groups]
+                if not live:
+                    logger.critical(f"AI billing/auth error on all providers: {exc}")
+                    break
+                logger.warning(
+                    f"AI provider {active_route.billing_group}/{active_route.model} billing/auth error ({exc}), "
+                    f"switching to fallback {routes[live[0]].billing_group}/{routes[live[0]].model}"
+                )
+                route_idx = live[0]
+                continue
+
+            logger.warning(
+                f"AI API error on {active_route.billing_group}/{active_route.model} "
+                f"(attempt {attempt}/{MAX_RETRIES}): {exc}"
+            )
+            live_others = [
+                i for i, r in enumerate(routes)
+                if i != route_idx and r.billing_group not in dead_billing_groups
+            ]
+            if live_others:
+                route_idx = live_others[0]
+                logger.info(f"Switching to fallback AI route {routes[route_idx].billing_group}/{routes[route_idx].model}")
+            else:
+                await asyncio.sleep(attempt * 2)
+            attempt += 1
             continue
 
         usage = response.usage
-        logger.info(
-            f"Claude {AI_MODEL}: input={usage.input_tokens} cache_read={usage.cache_read_input_tokens} "
-            f"cache_write={usage.cache_creation_input_tokens} output={usage.output_tokens} stop={response.stop_reason}"
+        if usage is not None:
+            logger.info(
+                f"AI {active_route.model}: input={usage.input_tokens} cache_read={usage.cache_read_input_tokens} "
+                f"cache_write={usage.cache_creation_input_tokens} output={usage.output_tokens} stop={response.stop_reason}"
+            )
+        submit_block = next(
+            (b for b in response.content if b.type == "tool_use" and b.name == "submit_answer"),
+            None,
         )
-        raw = "".join(b.text for b in response.content if b.type == "text").strip()
+        if submit_block is not None:
+            raw = json.dumps(submit_block.input, ensure_ascii=False)
+        else:
+            raw = "".join(b.text for b in response.content if b.type == "text").strip()
         if not raw:
             # Пустой ответ — почти всегда обрыв по max_tokens; повтор даст то же самое.
-            logger.error(f"Claude returned no text (stop_reason={response.stop_reason})")
+            logger.error(f"AI {active_route.model} returned no text (stop_reason={response.stop_reason})")
             break
         try:
             parsed = SupportAnswer.model_validate_json(raw)
         except ValidationError as exc:
-            logger.warning(f"Claude returned invalid JSON (attempt {attempt}/{MAX_RETRIES}): {exc}")
+            logger.warning(f"AI {active_route.model} returned invalid JSON (attempt {attempt}/{MAX_RETRIES}): {exc}")
+            if submit_block is None:
+                messages.append({"role": "assistant", "content": raw})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Ошибка формата: ты ответил обычным текстом вместо вызова инструмента submit_answer. "
+                            "ОБЯЗАТЕЛЬНО вызови инструмент submit_answer со всеми обязательными полями схемы."
+                        ),
+                    }
+                )
+            attempt += 1
             continue
 
         if not parsed.no_reply_needed and not parsed.answer and not parsed.escalate_reason:
-            logger.warning(f"Claude returned an empty answer (attempt {attempt}/{MAX_RETRIES})")
+            logger.warning(f"AI {active_route.model} returned an empty answer (attempt {attempt}/{MAX_RETRIES})")
+            attempt += 1
             continue
         if _LEAKED_META_RE.search(parsed.answer) or _LEAKED_META_RE.search(parsed.escalate_reason):
-            logger.warning(f"Claude leaked service text (attempt {attempt}/{MAX_RETRIES}): {parsed.answer!r}")
+            logger.warning(f"AI {active_route.model} leaked service text (attempt {attempt}/{MAX_RETRIES}): {parsed.answer!r}")
+            attempt += 1
             continue
         if _ACTION_CLAIM_RE.search(parsed.answer):
             # Поправка только в локальном запросе — в историю топика не пишется.
-            logger.warning(f"Claude claimed an action it can't perform (attempt {attempt}/{MAX_RETRIES}): {parsed.answer!r}")
-            messages.append({"role": "assistant", "content": raw})
-            messages.append({"role": "user", "content": _FALSE_CLAIM_CORRECTION})
+            logger.warning(f"AI {active_route.model} claimed an action it can't perform (attempt {attempt}/{MAX_RETRIES}): {parsed.answer!r}")
+            if submit_block is not None:
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": submit_block.id,
+                                "content": _FALSE_CLAIM_CORRECTION,
+                                "is_error": True,
+                            }
+                        ],
+                    }
+                )
+            else:
+                messages.append({"role": "assistant", "content": raw})
+                messages.append({"role": "user", "content": _FALSE_CLAIM_CORRECTION})
+            attempt += 1
             continue
 
         parsed.answer = _strip_trailing_json_debris(parsed.answer)
@@ -269,8 +521,10 @@ async def get_ai_answer(
         result = parsed
         break
 
+    if on_commit is not None:
+        on_commit()
     if result is None:
-        logger.error(f"Claude gave no usable answer for topic {topic_id}")
+        logger.error(f"AI gave no usable answer for topic {topic_id}")
     note = result.attachment_note if result else ""
     await ai_context.append_turn(topic_id, "user", _history_entry(text, attachments, note) or "[вложение]")
     return result
