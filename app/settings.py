@@ -16,8 +16,8 @@ class Settings(BaseSettings):
     gpuniq_api_key: str = ""
     gpuniq_base_url: str = "https://api.gpuniq.com"
     anthropic_api_key: str = ""
-    ai_model: str = "gemini-3-flash"
-    ai_fallback_model: str = "gpt-5.4-mini"
+    ai_model: str = "gpt-6-luna"
+    ai_fallback_model: str = "gemini-3-flash"
     anthropic_fallback_model: str = "claude-haiku-4-5-20251001"
     admin_tags: str = "@asradyuk"
 
