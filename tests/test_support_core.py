@@ -197,3 +197,85 @@ async def test_burger_inflight_coalescing(monkeypatch: pytest.MonkeyPatch) -> No
     await asyncio.sleep(0.08)
 
     assert calls == ["Привет", "Привет\nВсе серверы n/a в Happ"]
+
+
+async def test_burger_remnawave_hwid_formatting_and_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import remnawave
+    from app.handlers import faq
+
+    monkeypatch.setattr(remnawave, "REMNAWAVE_URL", "https://panel.example.com")
+    monkeypatch.setattr(remnawave, "REMNAWAVE_TOKEN", "test-token")
+    monkeypatch.setattr(remnawave, "_panel_cache", {})
+
+    calls: list[str] = []
+
+    async def fake_get(path: str, **params):
+        calls.append(path)
+        if path == "/api/users/stream":
+            return {
+                "response": {
+                    "users": [
+                        {
+                            "id": 16269,
+                            "username": "w_555",
+                            "status": "ACTIVE",
+                            "expireAt": "2026-12-15T10:00:00.000Z",
+                            "trafficLimitBytes": 26843545600,
+                            "hwidDeviceLimit": 2,
+                            "subscriptionUrl": "https://sub.vpnburger.ru/abc",
+                            "userTraffic": {"usedTrafficBytes": 1073741824},
+                        }
+                    ]
+                }
+            }
+        if path == "/api/hwid/devices/16269":
+            return {
+                "response": {
+                    "total": 2,
+                    "devices": [
+                        {
+                            "hwid": "hw_old",
+                            "platform": "macOS",
+                            "osVersion": "27.0",
+                            "deviceModel": "Mac",
+                            "userAgent": "Happ/6.3.0/macos catalyst/261028",
+                            "createdAt": "2026-11-01T12:00:00.000Z",
+                            "updatedAt": "2026-11-02T09:00:00.000Z",
+                        },
+                        {
+                            "hwid": "hw_new",
+                            "platform": "iOS",
+                            "osVersion": "27.0",
+                            "deviceModel": "iPhone 17",
+                            "userAgent": "Incy/7.1.0/ios",
+                            "createdAt": "2026-10-31T10:31:30.000Z",
+                            "updatedAt": "2026-11-03T18:40:00.000Z",
+                        },
+                    ],
+                }
+            }
+        if path == "/api/users/16269/subscription-request-history":
+            return {"response": {"records": []}}
+        return None
+
+    monkeypatch.setattr(remnawave, "_get", fake_get)
+
+    lines = await remnawave.get_panel_lines(555)
+    joined = "\n".join(lines)
+    assert "Устройства (HWID): 2/2" in joined
+    assert "iOS · iPhone 17 · OS 27.0 (приложение: Incy 7.1.0, добавлено 31.10.2026, активность 03.11.2026 21:40)" in joined
+    assert "macOS · Mac · OS 27.0 (приложение: Happ 6.3.0, добавлено 01.11.2026, активность 02.11.2026 12:00)" in joined
+    # Сортировка по свежей активности: iPhone 17 выше Mac
+    assert joined.index("iPhone 17") < joined.index("macOS · Mac")
+
+    first_call_count = len(calls)
+    await remnawave.get_panel_lines(555)
+    assert len(calls) == first_call_count  # взято из TTL-кэша
+
+    await remnawave.get_panel_lines(555, force_refresh=True)
+    assert len(calls) > first_call_count  # принудительное обновление обошло кэш
+
+    assert "Мои устройства" in ai_support.SYSTEM_PROMPT
+    assert "Расширить подписку" in ai_support.SYSTEM_PROMPT
+    assert "Сменить тариф" not in ai_support.SYSTEM_PROMPT
+    assert "Мои устройства" in faq._BY_KEY["devices"].text

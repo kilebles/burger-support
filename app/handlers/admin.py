@@ -97,7 +97,7 @@ async def handle_refresh_card(message: Message):
     await message.bot.send_message(
         chat_id=SUPPORT_CHAT_ID,
         message_thread_id=message.message_thread_id,
-        text=await build_user_card(user_id, chat.full_name, chat.username),
+        text=await build_user_card(user_id, chat.full_name, chat.username, force_refresh=True),
         reply_markup=card_keyboard(),
     )
 

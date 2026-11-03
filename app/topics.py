@@ -59,14 +59,16 @@ async def forget_topic(user_id: int) -> None:
             await _save()
 
 
-async def build_user_card(user_id: int, full_name: str, username: str | None) -> str:
+async def build_user_card(
+    user_id: int, full_name: str, username: str | None, *, force_refresh: bool = False
+) -> str:
     """Info card text for a user: Telegram identity + subscription info from the Remnawave panel."""
     username_line = f"@{escape(username)}" if username else "не указан"
     card_lines = [
         f"👤 {escape(full_name)}",
         f"Username: {username_line}",
         f"ID: <code>{user_id}</code>",
-        *await get_panel_lines(user_id),
+        *await get_panel_lines(user_id, force_refresh=force_refresh),
     ]
     return "\n".join(card_lines)
 
