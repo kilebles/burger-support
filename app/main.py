@@ -16,7 +16,10 @@ async def main():
 
     bot = Bot(
         token=TOKEN,
-        default=DefaultBotProperties(parse_mode='HTML')
+        default=DefaultBotProperties(
+            parse_mode='HTML',
+            link_preview_is_disabled=True,
+        ),
     )
     bot.session.middleware(RetryAfterMiddleware())
 

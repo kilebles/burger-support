@@ -279,3 +279,21 @@ async def test_burger_remnawave_hwid_formatting_and_cache(monkeypatch: pytest.Mo
     assert "Расширить подписку" in ai_support.SYSTEM_PROMPT
     assert "Сменить тариф" not in ai_support.SYSTEM_PROMPT
     assert "Мои устройства" in faq._BY_KEY["devices"].text
+
+
+async def test_send_to_client_disables_link_preview(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app import delivery
+
+    sent_calls: list[dict] = []
+
+    async def fake_send_message(**kwargs):
+        sent_calls.append(kwargs)
+        return SimpleNamespace(message_id=len(sent_calls))
+
+    monkeypatch.setattr(ai_context, "append_turn", AsyncMock())
+    bot = SimpleNamespace(send_message=AsyncMock(side_effect=fake_send_message))
+
+    ok = await delivery.send_to_client(bot, user_id=777, topic_id=88, text="Ссылка: https://example.com")
+    assert ok is True
+    assert len(sent_calls) == 2
+    assert all(call["link_preview_options"].is_disabled is True for call in sent_calls)

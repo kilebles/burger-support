@@ -3,12 +3,14 @@
 from typing import Optional
 
 from aiogram import Bot
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup, LinkPreviewOptions
 from loguru import logger
 
 from app import ai_context
 from app.media import Video, send_video_to_topic
 from app.settings import SUPPORT_CHAT_ID
+
+_NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 
 async def send_to_client(
@@ -23,9 +25,19 @@ async def send_to_client(
     """staff=True — текст от живого сотрудника (быстрый ответ, кнопка), в
     истории помечается, чтобы ИИ не противоречил человеку."""
     try:
-        sent = await bot.send_message(chat_id=SUPPORT_CHAT_ID, message_thread_id=topic_id, text=text, parse_mode=None)
-        await bot.copy_message(
-            chat_id=user_id, from_chat_id=SUPPORT_CHAT_ID, message_id=sent.message_id, reply_markup=reply_markup
+        await bot.send_message(
+            chat_id=SUPPORT_CHAT_ID,
+            message_thread_id=topic_id,
+            text=text,
+            parse_mode=None,
+            link_preview_options=_NO_LINK_PREVIEW,
+        )
+        await bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode=None,
+            reply_markup=reply_markup,
+            link_preview_options=_NO_LINK_PREVIEW,
         )
     except Exception:
         logger.exception(f"Failed to deliver support message to user_id={user_id}")
